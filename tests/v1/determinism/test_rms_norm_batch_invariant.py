@@ -77,85 +77,96 @@ def test_rms_norm_batch_invariant_vs_standard(
 @pytest.mark.parametrize("hidden_size", [512, 4096])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("eps", [1e-6])
+@pytest.mark.parametrize("n_extra", [3, 299])
+@pytest.mark.parametrize("seed", list(range(16)))
 def test_fused_add_rms_norm_batch_invariant_residual_path(
     hidden_size: int,
     dtype: torch.dtype,
     eps: float,
+    n_extra: int,
+    seed: int,
 ):
     """
     Test the batch-invariant fused residual-add + RMSNorm helper directly.
 
     The kernel picks ``max_block_size = (num_tokens < 256) ? 1024 : 256``, so a
-    token reduces with block=1024 alone but block=256 inside a batch of >=256;
-    the different reduction width can flip the last bit of the fp32 sum. That
-    divergence is data dependent, so sweep many seeds (instead of betting on a
-    single one) and use a 300-token batch to actually cross the 256 threshold.
+    token reduces with block=1024 when nearly alone but block=256 inside a batch
+    of >=256; the different reduction width can flip the last bit of the fp32
+    sum. ``n_extra=299`` (num_tokens=300) crosses that threshold while
+    ``n_extra=3`` stays below it, and ``seed`` sweeps inputs so the data-
+    dependent divergence cannot hide behind a single lucky seed.
     """
-    import vllm._custom_ops as ops
-
     device = torch.device(DEVICE_TYPE)
 
-    def fused_add_rms_norm(x, residual, w) -> tuple[torch.Tensor, torch.Tensor]:
-        ops.fused_add_rms_norm(x, residual, w, eps)
+    torch.manual_seed(seed)
+    x_single = torch.randn(1, hidden_size, dtype=dtype, device=device)
+    residual_single = torch.randn(1, hidden_size, dtype=dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+
+    x_batch = torch.cat(
+        [
+            x_single,
+            torch.randn(n_extra, hidden_size, dtype=dtype, device=device),
+        ],
+        dim=0,
+    )
+    residual_batch = torch.cat(
+        [
+            residual_single,
+            torch.randn(n_extra, hidden_size, dtype=dtype, device=device),
+        ],
+        dim=0,
+    )
+
+    def fused_add_rms_norm(x, residual, w, e) -> tuple[torch.Tensor, torch.Tensor]:
+        import vllm._custom_ops as ops
+
+        ops.fused_add_rms_norm(x, residual, w, e)
         return x, residual
 
-    for seed in range(64):
-        torch.manual_seed(seed)
-        x_single = torch.randn(1, hidden_size, dtype=dtype, device=device)
-        residual_single = torch.randn(1, hidden_size, dtype=dtype, device=device)
-        weight = torch.randn(hidden_size, dtype=dtype, device=device)
+    out_single, residual_out_single = fused_add_rms_norm(
+        x_single.clone(),
+        residual_single.clone(),
+        weight,
+        eps,
+    )
+    out_batch, residual_out_batch = fused_add_rms_norm(
+        x_batch.clone(),
+        residual_batch.clone(),
+        weight,
+        eps,
+    )
 
-        # 299 extra rows -> num_tokens=300 (>=256) crosses the block-size
-        # threshold, so the shared token uses block=256 here vs block=1024 alone.
-        x_batch = torch.cat(
-            [x_single, torch.randn(299, hidden_size, dtype=dtype, device=device)],
-            dim=0,
-        )
-        residual_batch = torch.cat(
-            [
-                residual_single,
-                torch.randn(299, hidden_size, dtype=dtype, device=device),
-            ],
-            dim=0,
-        )
+    merged_single = x_single + residual_single
+    ref_out = rms_norm_batch_invariant(merged_single, weight, eps=eps)
 
-        out_single, residual_out_single = fused_add_rms_norm(
-            x_single.clone(), residual_single.clone(), weight
-        )
-        out_batch, residual_out_batch = fused_add_rms_norm(
-            x_batch.clone(), residual_batch.clone(), weight
-        )
-
-        merged_single = x_single + residual_single
-        torch.testing.assert_close(
-            residual_out_single,
-            merged_single,
-            rtol=0.0,
-            atol=0.0,
-            msg=f"Residual output should equal x + residual exactly (seed={seed})",
-        )
-        torch.testing.assert_close(
-            residual_out_batch[:1],
-            merged_single,
-            rtol=0.0,
-            atol=0.0,
-            msg=f"Residual output should be batch invariant (seed={seed})",
-        )
-        torch.testing.assert_close(
-            out_single,
-            out_batch[:1],
-            rtol=0.0,
-            atol=0.0,
-            msg="Fused add RMSNorm output should be batch invariant across the "
-            f"num_tokens=256 block-size threshold (seed={seed})",
-        )
+    torch.testing.assert_close(
+        residual_out_single,
+        merged_single,
+        rtol=0.0,
+        atol=0.0,
+        msg="Residual output should equal x + residual exactly",
+    )
+    torch.testing.assert_close(
+        residual_out_batch[:1],
+        merged_single,
+        rtol=0.0,
+        atol=0.0,
+        msg="Residual output should be batch invariant",
+    )
+    torch.testing.assert_close(
+        out_single,
+        out_batch[:1],
+        rtol=0.0,
+        atol=0.0,
+        msg="Fused add RMSNorm output should be batch invariant",
+    )
 
     if dtype == torch.bfloat16:
         rtol, atol = 1e-1, 1e-1
     else:
         rtol, atol = 1e-2, 1e-2
 
-    ref_out = rms_norm_batch_invariant(merged_single, weight, eps=eps)
     torch.testing.assert_close(
         out_single,
         ref_out,
