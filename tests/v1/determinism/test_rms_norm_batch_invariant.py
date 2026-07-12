@@ -167,6 +167,64 @@ def test_fused_add_rms_norm_batch_invariant_residual_path(
 
 
 @skip_unsupported
+@pytest.mark.parametrize("hidden_size", [512, 2048, 4096])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("large_batch", [256, 300])
+def test_fused_add_rms_norm_batch_invariant_across_block_size_threshold(
+    hidden_size: int,
+    dtype: torch.dtype,
+    large_batch: int,
+):
+    """Guard against the num_tokens-dependent block size in fused_add_rms_norm.
+
+    The CUDA kernel picks ``max_block_size = (num_tokens < 256) ? 1024 : 256``.
+    A single token processed alone (num_tokens=1, block=1024) and the same token
+    inside a batch of >=256 (block=256 without the fix) would then reduce with a
+    different summation order, breaking bit-exactness. This test crosses that
+    threshold, which the num_tokens=1 vs 4 case cannot exercise.
+    """
+    import vllm._custom_ops as ops
+
+    device = torch.device(DEVICE_TYPE)
+    eps = 1e-6
+
+    torch.manual_seed(0)
+    x_single = torch.randn(1, hidden_size, dtype=dtype, device=device)
+    residual_single = torch.randn(1, hidden_size, dtype=dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+
+    x_batch = torch.randn(large_batch, hidden_size, dtype=dtype, device=device)
+    residual_batch = torch.randn(large_batch, hidden_size, dtype=dtype, device=device)
+    x_batch[0].copy_(x_single[0])
+    residual_batch[0].copy_(residual_single[0])
+
+    x_s, res_s = x_single.clone(), residual_single.clone()
+    ops.fused_add_rms_norm(x_s, res_s, weight, eps)
+
+    x_b, res_b = x_batch.clone(), residual_batch.clone()
+    ops.fused_add_rms_norm(x_b, res_b, weight, eps)
+
+    torch.testing.assert_close(
+        res_b[:1],
+        res_s,
+        rtol=0.0,
+        atol=0.0,
+        msg=f"Residual output not batch invariant across the num_tokens=256 "
+        f"block-size threshold (hidden_size={hidden_size}, dtype={dtype}, "
+        f"large_batch={large_batch})",
+    )
+    torch.testing.assert_close(
+        x_b[:1],
+        x_s,
+        rtol=0.0,
+        atol=0.0,
+        msg=f"Fused add RMSNorm output not batch invariant across the "
+        f"num_tokens=256 block-size threshold (hidden_size={hidden_size}, "
+        f"dtype={dtype}, large_batch={large_batch})",
+    )
+
+
+@skip_unsupported
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
 @pytest.mark.parametrize("seq_len", [1, 32, 512])
 @pytest.mark.parametrize("hidden_size", [2048, 4096])
